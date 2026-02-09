@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.env
+.venv
+logs/
+logs/
+discordbot.log
+*.csv
+*.txt
+practice.py
+lec2.py
