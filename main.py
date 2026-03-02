@@ -55,31 +55,40 @@ FFMPEG_EXE = r"C:\discordbot.py\bin\ffmpeg.exe"
 _COOKIES_FILE = os.path.join(script_dir, 'cookies.txt')
 _cookies_found = os.path.exists(_COOKIES_FILE)
 
+# Primary options: ios is the most reliable player client for datacenter IPs
 YTDL_OPTIONS = {
     'format': 'bestaudio/best',
     'noplaylist': True,
     'default_search': 'ytsearch',
     'quiet': True,
     'no_warnings': True,
-    # Use android_embedded + tv_embedded — these bypass bot checks on
-    # datacenter IPs without needing cookies (YouTube treats them as
-    # trusted app clients, not browser bots).
     'extractor_args': {
         'youtube': {
-            'player_client': ['android_embedded', 'tv_embedded'],
-            'player_skip': ['webpage', 'configs'],   # skip JS parsing → faster
+            # ios → most reliable on server IPs; mweb as backup
+            'player_client': ['ios', 'mweb'],
         },
     },
     'source_address': '0.0.0.0',
-    # If a cookies.txt file exists (exported from your browser), use it.
+    **(({'cookiefile': _COOKIES_FILE}) if _cookies_found else {}),
+}
+
+# Fallback options: cookies only (used if primary fails)
+YTDL_OPTIONS_FALLBACK = {
+    'format': 'bestaudio/best',
+    'noplaylist': True,
+    'default_search': 'ytsearch',
+    'quiet': True,
+    'no_warnings': True,
+    'source_address': '0.0.0.0',
     **(({'cookiefile': _COOKIES_FILE}) if _cookies_found else {}),
 }
 
 # Logged at startup — check via !botlogs to confirm cookies are loaded
 if _cookies_found:
-    logging.getLogger(__name__).info(f'[yt-dlp] ✅ cookies.txt found — YouTube auth enabled.')
+    logging.getLogger(__name__).info('[yt-dlp] ✅ cookies.txt found — YouTube auth enabled.')
 else:
     logging.getLogger(__name__).warning('[yt-dlp] ⚠️ cookies.txt NOT found — YouTube may block on datacenter IPs.')
+
 
 FFMPEG_OPTIONS = {
     'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
@@ -978,6 +987,27 @@ async def botlogs(ctx, lines: int = 20):
 #  MUSIC COMMANDS
 # ================================================================
 
+async def _yt_extract(search: str) -> dict | None:
+    """Try primary yt-dlp options, fall back to fallback options on bot block."""
+    loop = asyncio.get_event_loop()
+    for opts, label in [(YTDL_OPTIONS, 'primary'), (YTDL_OPTIONS_FALLBACK, 'fallback')]:
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = await loop.run_in_executor(
+                    None, lambda o=opts: yt_dlp.YoutubeDL(o).extract_info(search, download=False)
+                )
+            if info and 'entries' in info:
+                info = info['entries'][0]
+            logger.info(f'[yt-dlp] ✅ Extracted via {label}: {info.get("title")}')
+            return info
+        except Exception as e:
+            err = str(e)
+            logger.warning(f'[yt-dlp] ❌ {label} failed: {err}')
+            if 'Sign in' not in err and 'bot' not in err.lower():
+                # Not a bot-block error — no point retrying
+                return None
+    return None
+
 @bot.command()
 @commands.is_owner()
 async def ping(ctx):
@@ -1033,37 +1063,32 @@ async def play(ctx, *, search=None):
             return await ctx.send(f"Error reading Spotify link: {e}")
 
     async with ctx.typing():
-        with yt_dlp.YoutubeDL(YTDL_OPTIONS) as ydl:
-            try:
-                info = ydl.extract_info(search, download=False)
-                if 'entries' in info:
-                    info = info['entries'][0]
+        info = await _yt_extract(search)
+        if info is None:
+            return await ctx.send("❌ Could not find or stream that song. YouTube may be blocking requests — try again or use a different search term.")
 
-                song_data = {
-                    'url': info['url'],
-                    'title': info['title'],
-                    'thumbnail': info.get('thumbnail'),
-                    'duration': info.get('duration'),
-                }
+        song_data = {
+            'url': info['url'],
+            'title': info['title'],
+            'thumbnail': info.get('thumbnail'),
+            'duration': info.get('duration'),
+        }
 
-                now_playing_channel = ctx.channel
+        now_playing_channel = ctx.channel
 
-                if not ctx.voice_client.is_playing():
-                    song_queue.append(song_data)
-                    play_next(ctx)
-                else:
-                    song_queue.append(song_data)
-                    embed = discord.Embed(
-                        title="➕ Added to Queue",
-                        description=f"**{info['title']}**",
-                        color=discord.Color.from_rgb(57, 197, 187)
-                    )
-                    if song_data['thumbnail']:
-                        embed.set_thumbnail(url=song_data['thumbnail'])
-                    await ctx.send(embed=embed)
-
-            except Exception as e:
-                await ctx.send(f"Song not found. ({e})")
+        if not ctx.voice_client.is_playing():
+            song_queue.append(song_data)
+            play_next(ctx)
+        else:
+            song_queue.append(song_data)
+            embed = discord.Embed(
+                title="➕ Added to Queue",
+                description=f"**{info['title']}**",
+                color=discord.Color.from_rgb(57, 197, 187)
+            )
+            if song_data['thumbnail']:
+                embed.set_thumbnail(url=song_data['thumbnail'])
+            await ctx.send(embed=embed)
 
 
 @bot.command(aliases=['pn'])
@@ -1101,37 +1126,32 @@ async def playnext(ctx, *, search=None):
             return await ctx.send(f"Error reading Spotify link: {e}")
 
     async with ctx.typing():
-        with yt_dlp.YoutubeDL(YTDL_OPTIONS) as ydl:
-            try:
-                info = ydl.extract_info(search, download=False)
-                if 'entries' in info:
-                    info = info['entries'][0]
+        info = await _yt_extract(search)
+        if info is None:
+            return await ctx.send("❌ Could not find or stream that song. YouTube may be blocking requests — try again or use a different search term.")
 
-                song_data = {
-                    'url': info['url'],
-                    'title': info['title'],
-                    'thumbnail': info.get('thumbnail'),
-                    'duration': info.get('duration'),
-                }
+        song_data = {
+            'url': info['url'],
+            'title': info['title'],
+            'thumbnail': info.get('thumbnail'),
+            'duration': info.get('duration'),
+        }
 
-                now_playing_channel = ctx.channel
+        now_playing_channel = ctx.channel
 
-                if not ctx.voice_client.is_playing():
-                    song_queue.append(song_data)
-                    play_next(ctx)
-                else:
-                    song_queue.insert(0, song_data)
-                    embed = discord.Embed(
-                        title="⏭️ Queued Next",
-                        description=f"**{info['title']}**",
-                        color=discord.Color.from_rgb(250, 166, 26)
-                    )
-                    if song_data['thumbnail']:
-                        embed.set_thumbnail(url=song_data['thumbnail'])
-                    await ctx.send(embed=embed)
-
-            except Exception as e:
-                await ctx.send(f"Song not found. ({e})")
+        if not ctx.voice_client.is_playing():
+            song_queue.append(song_data)
+            play_next(ctx)
+        else:
+            song_queue.insert(0, song_data)
+            embed = discord.Embed(
+                title="⏭️ Queued Next",
+                description=f"**{info['title']}**",
+                color=discord.Color.from_rgb(250, 166, 26)
+            )
+            if song_data['thumbnail']:
+                embed.set_thumbnail(url=song_data['thumbnail'])
+            await ctx.send(embed=embed)
 
 
 @bot.command(aliases=['q'])
