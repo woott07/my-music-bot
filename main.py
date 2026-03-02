@@ -214,6 +214,40 @@ def play_next(ctx):
         current_song = None
         return
 
+    if song.get('is_lazy'):
+        # Lazy load: resolve the search query to a stream URL just in time
+        async def resolve_and_play():
+            try:
+                info = await _yt_extract(song['search'])
+                if not info:
+                    if ctx.voice_client and ctx.voice_client.is_connected():
+                        play_next(ctx)
+                    return
+                
+                # Update song with full info
+                song['url'] = info.get('url')
+                song['title'] = info.get('title', song['search'])
+                song['thumbnail'] = info.get('thumbnail')
+                song['duration'] = info.get('duration')
+                song['is_lazy'] = False
+                
+                source = discord.FFmpegPCMAudio(song['url'], executable=FFMPEG_EXE, **FFMPEG_OPTIONS)
+                if ctx.voice_client and ctx.voice_client.is_connected():
+                    ctx.voice_client.play(source, after=lambda e: play_next(ctx))
+                    
+                    channel = now_playing_channel or ctx.channel
+                    embed = _build_now_playing_embed(song)
+                    view = MusicControls(ctx)
+                    await channel.send(embed=embed, view=view)
+            except Exception as e:
+                logger.error(f"Lazy resolve error: {e}")
+                if ctx.voice_client and ctx.voice_client.is_connected():
+                    play_next(ctx)
+
+        asyncio.run_coroutine_threadsafe(resolve_and_play(), ctx.bot.loop)
+        return
+
+    # Standard path (already resolved)
     source = discord.FFmpegPCMAudio(song['url'], executable=FFMPEG_EXE, **FFMPEG_OPTIONS)
     ctx.voice_client.play(source, after=lambda e: play_next(ctx))
 
@@ -224,6 +258,7 @@ def play_next(ctx):
         await channel.send(embed=embed, view=view)
 
     asyncio.run_coroutine_threadsafe(send_now_playing(), ctx.bot.loop)
+
 
 
 # ================================================================
@@ -982,15 +1017,13 @@ async def botlogs(ctx, lines: int = 20):
 #  MUSIC COMMANDS
 # ================================================================
 
-async def _scrape_og_query(url: str, source: str) -> str | None:
+async def _scrape_og_query(url: str, source: str) -> str | list[str] | None:
     """
-    Shared helper: scrapes Open Graph meta tags from a music streaming page
-    to build a YouTube search query (track name + artist).
-    Works for Spotify, Apple Music, and similar services — no API key needed.
+    Shared helper: scrapes Open Graph meta tags from a music streaming page.
+    If it's a playlist, returns a list of track URLs.
+    If it's a track, returns a YouTube search query.
     """
     try:
-        # We must use a known crawler User-Agent (like Discord or Facebook)
-        # otherwise Spotify/Apple Music serve an empty React skeleton via JS.
         headers = {
             'User-Agent': (
                 'Mozilla/5.0 (compatible; Discordbot/2.0; +https://discordapp.com)'
@@ -1004,6 +1037,14 @@ async def _scrape_og_query(url: str, source: str) -> str | None:
                     return None
                 html = await resp.text()
 
+        # Is it a playlist/album?
+        if 'playlist' in url or 'album' in url:
+            track_urls = re.findall(r'<meta name="music:song" content="([^"]+)"', html)
+            if track_urls:
+                # Return up to 50 track URLs from the playlist
+                logger.info(f'[{source}] Found playlist with {len(track_urls[:50])} tracks.')
+                return track_urls[:50]
+
         title_match = re.search(r'<meta property="og:title" content="([^"]+)"', html)
         desc_match  = re.search(r'<meta property="og:description" content="([^"]+)"', html)
 
@@ -1014,13 +1055,9 @@ async def _scrape_og_query(url: str, source: str) -> str | None:
 
         if desc_match:
             desc  = desc_match.group(1).strip()
-            # Spotify:    "Song · Artist · Year"
-            # Apple Music: "Song - Single - Artist" or "Artist · Song"
-            # Try · separator first, then –
             for sep in ['·', ' - ', ' – ']:
                 parts = [p.strip() for p in desc.split(sep)]
                 if len(parts) >= 2:
-                    # Pick the part that is NOT the title
                     artist = next((p for p in parts if p.lower() not in title.lower()), parts[0])
                     query  = f"{title} {artist} audio"
                     logger.info(f'[{source}] Resolved → "{query}"')
@@ -1034,18 +1071,22 @@ async def _scrape_og_query(url: str, source: str) -> str | None:
         return None
 
 
-async def get_spotify_query(url: str) -> str | None:
-    """Get YouTube search query from a Spotify URL (no API key needed)."""
+async def get_spotify_query(url: str) -> str | list[str] | None:
     return await _scrape_og_query(url, 'Spotify')
 
 
-async def get_apple_music_query(url: str) -> str | None:
-    """Get YouTube search query from an Apple Music URL (no API key needed)."""
+async def get_apple_music_query(url: str) -> str | list[str] | None:
     return await _scrape_og_query(url, 'Apple Music')
 
 
 async def _yt_extract(search: str) -> dict | None:
-    """Try primary yt-dlp options, always fall back to fallback options on any failure."""
+    """Try primary yt-dlp options, auto-resolve Spotify/Apple URLs via lazy load, fall back on failure."""
+    # If the search is a raw Spotify/Apple streaming link from a lazy playlist
+    if "spotify.com" in search:
+        search = await get_spotify_query(search) or search
+    elif "music.apple.com" in search:
+        search = await get_apple_music_query(search) or search
+
     loop = asyncio.get_event_loop()
     for opts, label in [(YTDL_OPTIONS, 'primary'), (YTDL_OPTIONS_FALLBACK, 'fallback')]:
         try:
@@ -1096,15 +1137,35 @@ async def play(ctx, *, search=None):
     if "spotify.com" in search:
         query = await get_spotify_query(search)
         if not query:
-            return await ctx.send("❌ Could not read that Spotify link. Try pasting the song name directly.")
-        if "playlist" in search or "album" in search:
-            await ctx.send("🔍 Spotify link detected — playing the **first track**.")
+            return await ctx.send("❌ Could not read that Spotify link.")
+        if isinstance(query, list):
+            await ctx.send(f"🔍 Spotify playlist detected! ⏳ Queuing {len(query)} tracks lazily...")
+            songs = [{'is_lazy': True, 'search': url, 'title': 'Loading track...'} for url in query]
+            
+            now_playing_channel = ctx.channel
+            if not ctx.voice_client.is_playing():
+                song_queue.append(songs.pop(0))
+                play_next(ctx)
+            if songs:
+                song_queue.extend(songs)
+            return
         search = query
 
     elif "music.apple.com" in search:
         query = await get_apple_music_query(search)
         if not query:
-            return await ctx.send("❌ Could not read that Apple Music link. Try pasting the song name directly.")
+            return await ctx.send("❌ Could not read that Apple Music link.")
+        if isinstance(query, list):
+            await ctx.send(f"🔍 Apple Music playlist detected! ⏳ Queuing {len(query)} tracks lazily...")
+            songs = [{'is_lazy': True, 'search': url, 'title': 'Loading track...'} for url in query]
+            
+            now_playing_channel = ctx.channel
+            if not ctx.voice_client.is_playing():
+                song_queue.append(songs.pop(0))
+                play_next(ctx)
+            if songs:
+                song_queue.extend(songs)
+            return
         search = query
 
     async with ctx.typing():
@@ -1112,7 +1173,12 @@ async def play(ctx, *, search=None):
         if info is None:
             return await ctx.send("❌ Could not find or stream that song. YouTube may be blocking requests — try again or use a different search term.")
 
+        if 'entries' in info and getattr(info, 'get', lambda k: None)('_type') == 'playlist':
+            # It's a YouTube playlist
+            await ctx.send("🔍 YouTube Playlist detected! (Note: Only first video added, edit bot config `YTDL_OPTIONS` to allow full YouTube playlists if desired).")
+
         song_data = {
+            'is_lazy': False,
             'url': info['url'],
             'title': info['title'],
             'thumbnail': info.get('thumbnail'),
@@ -1136,6 +1202,7 @@ async def play(ctx, *, search=None):
             await ctx.send(embed=embed)
 
 
+
 @bot.command(aliases=['pn'])
 async def playnext(ctx, *, search=None):
     track_cmd("playnext")
@@ -1149,15 +1216,38 @@ async def playnext(ctx, *, search=None):
     if "spotify.com" in search:
         query = await get_spotify_query(search)
         if not query:
-            return await ctx.send("❌ Could not read that Spotify link. Try pasting the song name directly.")
-        if "playlist" in search or "album" in search:
-            await ctx.send("🔍 Spotify link detected — queuing the **first track**.")
+            return await ctx.send("❌ Could not read that Spotify link.")
+        if isinstance(query, list):
+            await ctx.send(f"🔍 Spotify playlist detected! ⏳ Queuing {len(query)} tracks lazily next...")
+            songs = [{'is_lazy': True, 'search': url, 'title': 'Loading track...'} for url in query]
+            
+            now_playing_channel = ctx.channel
+            if not ctx.voice_client.is_playing():
+                song_queue.append(songs.pop(0))
+                play_next(ctx)
+            if songs:
+                # Insert all songs at the front of the queue
+                for i, song in enumerate(songs):
+                    song_queue.insert(i, song)
+            return
         search = query
 
     elif "music.apple.com" in search:
         query = await get_apple_music_query(search)
         if not query:
-            return await ctx.send("❌ Could not read that Apple Music link. Try pasting the song name directly.")
+            return await ctx.send("❌ Could not read that Apple Music link.")
+        if isinstance(query, list):
+            await ctx.send(f"🔍 Apple Music playlist detected! ⏳ Queuing {len(query)} tracks lazily next...")
+            songs = [{'is_lazy': True, 'search': url, 'title': 'Loading track...'} for url in query]
+            
+            now_playing_channel = ctx.channel
+            if not ctx.voice_client.is_playing():
+                song_queue.append(songs.pop(0))
+                play_next(ctx)
+            if songs:
+                for i, song in enumerate(songs):
+                    song_queue.insert(i, song)
+            return
         search = query
 
     async with ctx.typing():
@@ -1166,6 +1256,7 @@ async def playnext(ctx, *, search=None):
             return await ctx.send("❌ Could not find or stream that song. YouTube may be blocking requests — try again or use a different search term.")
 
         song_data = {
+            'is_lazy': False,
             'url': info['url'],
             'title': info['title'],
             'thumbnail': info.get('thumbnail'),
