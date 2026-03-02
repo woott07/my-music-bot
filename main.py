@@ -982,11 +982,11 @@ async def botlogs(ctx, lines: int = 20):
 #  MUSIC COMMANDS
 # ================================================================
 
-async def get_spotify_query(url: str) -> str | None:
+async def _scrape_og_query(url: str, source: str) -> str | None:
     """
-    Extract a YouTube search query from a Spotify URL by scraping
-    Spotify's public Open Graph meta tags.
-    No API key or Premium needed — works for tracks, playlists & albums.
+    Shared helper: scrapes Open Graph meta tags from a music streaming page
+    to build a YouTube search query (track name + artist).
+    Works for Spotify, Apple Music, and similar services — no API key needed.
     """
     try:
         headers = {
@@ -1000,13 +1000,11 @@ async def get_spotify_query(url: str) -> str | None:
             async with session.get(url, headers=headers,
                                    timeout=aiohttp.ClientTimeout(total=10)) as resp:
                 if resp.status != 200:
-                    logger.warning(f'[Spotify] HTTP {resp.status} for {url}')
+                    logger.warning(f'[{source}] HTTP {resp.status} for {url}')
                     return None
                 html = await resp.text()
 
-        # og:title → track/playlist name
         title_match = re.search(r'<meta property="og:title" content="([^"]+)"', html)
-        # og:description → "Song · Artist Name · Year" for tracks
         desc_match  = re.search(r'<meta property="og:description" content="([^"]+)"', html)
 
         if not title_match:
@@ -1016,20 +1014,35 @@ async def get_spotify_query(url: str) -> str | None:
 
         if desc_match:
             desc  = desc_match.group(1).strip()
-            # Format: "Song · Artist · Year" — grab artist (index 1)
-            parts = [p.strip() for p in desc.split('·')]
-            if len(parts) >= 2:
-                artist = parts[1]
-                query  = f"{title} {artist} audio"
-                logger.info(f'[Spotify] Resolved → "{query}"')
-                return query
+            # Spotify:    "Song · Artist · Year"
+            # Apple Music: "Song - Single - Artist" or "Artist · Song"
+            # Try · separator first, then –
+            for sep in ['·', ' - ', ' – ']:
+                parts = [p.strip() for p in desc.split(sep)]
+                if len(parts) >= 2:
+                    # Pick the part that is NOT the title
+                    artist = next((p for p in parts if p.lower() not in title.lower()), parts[0])
+                    query  = f"{title} {artist} audio"
+                    logger.info(f'[{source}] Resolved → "{query}"')
+                    return query
 
-        logger.info(f'[Spotify] Resolved (title only) → "{title} audio"')
+        logger.info(f'[{source}] Resolved (title only) → "{title} audio"')
         return f"{title} audio"
 
     except Exception as e:
-        logger.warning(f'[Spotify] Scrape error: {e}')
+        logger.warning(f'[{source}] Scrape error: {e}')
         return None
+
+
+async def get_spotify_query(url: str) -> str | None:
+    """Get YouTube search query from a Spotify URL (no API key needed)."""
+    return await _scrape_og_query(url, 'Spotify')
+
+
+async def get_apple_music_query(url: str) -> str | None:
+    """Get YouTube search query from an Apple Music URL (no API key needed)."""
+    return await _scrape_og_query(url, 'Apple Music')
+
 
 async def _yt_extract(search: str) -> dict | None:
     """Try primary yt-dlp options, always fall back to fallback options on any failure."""
@@ -1088,6 +1101,12 @@ async def play(ctx, *, search=None):
             await ctx.send("🔍 Spotify link detected — playing the **first track**.")
         search = query
 
+    elif "music.apple.com" in search:
+        query = await get_apple_music_query(search)
+        if not query:
+            return await ctx.send("❌ Could not read that Apple Music link. Try pasting the song name directly.")
+        search = query
+
     async with ctx.typing():
         info = await _yt_extract(search)
         if info is None:
@@ -1133,6 +1152,12 @@ async def playnext(ctx, *, search=None):
             return await ctx.send("❌ Could not read that Spotify link. Try pasting the song name directly.")
         if "playlist" in search or "album" in search:
             await ctx.send("🔍 Spotify link detected — queuing the **first track**.")
+        search = query
+
+    elif "music.apple.com" in search:
+        query = await get_apple_music_query(search)
+        if not query:
+            return await ctx.send("❌ Could not read that Apple Music link. Try pasting the song name directly.")
         search = query
 
     async with ctx.typing():
