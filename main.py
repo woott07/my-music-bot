@@ -51,26 +51,28 @@ bot = commands.Bot(command_prefix=commands.when_mentioned_or('!'), intents=inten
 # ---------------- Config ----------------
 FFMPEG_EXE = r"C:\discordbot.py\bin\ffmpeg.exe"
 
+# ── Build yt-dlp options with bot-detection bypass ────────────────
+_COOKIES_FILE = os.path.join(script_dir, 'cookies.txt')
+
 YTDL_OPTIONS = {
     'format': 'bestaudio/best',
     'noplaylist': True,
     'default_search': 'ytsearch',
     'quiet': True,
     'no_warnings': True,
-    # ── YouTube bot-detection bypass ──────────────────────────────
-    'http_headers': {
-        'User-Agent': (
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
-            'AppleWebKit/537.36 (KHTML, like Gecko) '
-            'Chrome/122.0.0.0 Safari/537.36'
-        ),
-    },
+    # Use android_embedded + tv_embedded — these bypass bot checks on
+    # datacenter IPs without needing cookies (YouTube treats them as
+    # trusted app clients, not browser bots).
     'extractor_args': {
         'youtube': {
-            'player_client': ['web'],
+            'player_client': ['android_embedded', 'tv_embedded'],
+            'player_skip': ['webpage', 'configs'],   # skip JS parsing → faster
         },
     },
     'source_address': '0.0.0.0',
+    # If a cookies.txt file exists (exported from your browser), use it.
+    # This is the most reliable long-term fix for Railway deployments.
+    **(({'cookiefile': _COOKIES_FILE}) if os.path.exists(_COOKIES_FILE) else {}),
 }
 
 FFMPEG_OPTIONS = {
