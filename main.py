@@ -1222,7 +1222,7 @@ async def restart(ctx):
 # ================================================================
 #  GEMINI AI
 # ================================================================
-gemini_client = genai.Client(api_key=os.getenv('Key'))
+gemini_client = genai.Client(api_key=os.getenv('key'))
 
 @bot.command(aliases=['ai', 'gemini'])
 async def ask(ctx, *, question=None):
