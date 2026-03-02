@@ -12,8 +12,7 @@ from dotenv import load_dotenv
 import logging
 from google import genai
 from collections import defaultdict
-import spotipy
-from spotipy.oauth2 import SpotifyClientCredentials
+import aiohttp
 
 # ---------------- Logging ----------------
 script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -34,11 +33,7 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 token = os.getenv('d_t')
 
-spotify_id = os.getenv('SPOTIPY_CLIENT_ID')
-spotify_secret = os.getenv('SPOTIPY_CLIENT_SECRET')
-sp = None
-if spotify_id and spotify_secret:
-    sp = spotipy.Spotify(auth_manager=SpotifyClientCredentials(client_id=spotify_id, client_secret=spotify_secret))
+# Spotify credentials removed — using free OG-tag scraper instead
 
 # ---------------- Intents ----------------
 intents = discord.Intents.default()
@@ -55,7 +50,7 @@ FFMPEG_EXE = r"C:\discordbot.py\bin\ffmpeg.exe"
 _COOKIES_FILE = os.path.join(script_dir, 'cookies.txt')
 _cookies_found = os.path.exists(_COOKIES_FILE)
 
-# Primary options: ios is the most reliable player client for datacenter IPs
+# Primary options: android bypasses bot checks AND supports bestaudio/best formats
 YTDL_OPTIONS = {
     'format': 'bestaudio/best',
     'noplaylist': True,
@@ -64,8 +59,8 @@ YTDL_OPTIONS = {
     'no_warnings': True,
     'extractor_args': {
         'youtube': {
-            # ios → most reliable on server IPs; mweb as backup
-            'player_client': ['ios', 'mweb'],
+            # android → bypasses bot checks on server IPs AND has full format support
+            'player_client': ['android', 'mweb'],
         },
     },
     'source_address': '0.0.0.0',
@@ -987,15 +982,63 @@ async def botlogs(ctx, lines: int = 20):
 #  MUSIC COMMANDS
 # ================================================================
 
+async def get_spotify_query(url: str) -> str | None:
+    """
+    Extract a YouTube search query from a Spotify URL by scraping
+    Spotify's public Open Graph meta tags.
+    No API key or Premium needed — works for tracks, playlists & albums.
+    """
+    try:
+        headers = {
+            'User-Agent': (
+                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                'AppleWebKit/537.36 (KHTML, like Gecko) '
+                'Chrome/122.0.0.0 Safari/537.36'
+            )
+        }
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers=headers,
+                                   timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status != 200:
+                    logger.warning(f'[Spotify] HTTP {resp.status} for {url}')
+                    return None
+                html = await resp.text()
+
+        # og:title → track/playlist name
+        title_match = re.search(r'<meta property="og:title" content="([^"]+)"', html)
+        # og:description → "Song · Artist Name · Year" for tracks
+        desc_match  = re.search(r'<meta property="og:description" content="([^"]+)"', html)
+
+        if not title_match:
+            return None
+
+        title = title_match.group(1).strip()
+
+        if desc_match:
+            desc  = desc_match.group(1).strip()
+            # Format: "Song · Artist · Year" — grab artist (index 1)
+            parts = [p.strip() for p in desc.split('·')]
+            if len(parts) >= 2:
+                artist = parts[1]
+                query  = f"{title} {artist} audio"
+                logger.info(f'[Spotify] Resolved → "{query}"')
+                return query
+
+        logger.info(f'[Spotify] Resolved (title only) → "{title} audio"')
+        return f"{title} audio"
+
+    except Exception as e:
+        logger.warning(f'[Spotify] Scrape error: {e}')
+        return None
+
 async def _yt_extract(search: str) -> dict | None:
-    """Try primary yt-dlp options, fall back to fallback options on bot block."""
+    """Try primary yt-dlp options, always fall back to fallback options on any failure."""
     loop = asyncio.get_event_loop()
     for opts, label in [(YTDL_OPTIONS, 'primary'), (YTDL_OPTIONS_FALLBACK, 'fallback')]:
         try:
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                info = await loop.run_in_executor(
-                    None, lambda o=opts: yt_dlp.YoutubeDL(o).extract_info(search, download=False)
-                )
+            info = await loop.run_in_executor(
+                None, lambda o=opts: yt_dlp.YoutubeDL(o).extract_info(search, download=False)
+            )
             if info and 'entries' in info:
                 info = info['entries'][0]
             logger.info(f'[yt-dlp] ✅ Extracted via {label}: {info.get("title")}')
@@ -1003,9 +1046,8 @@ async def _yt_extract(search: str) -> dict | None:
         except Exception as e:
             err = str(e)
             logger.warning(f'[yt-dlp] ❌ {label} failed: {err}')
-            if 'Sign in' not in err and 'bot' not in err.lower():
-                # Not a bot-block error — no point retrying
-                return None
+            # Always fall through to the next option set
+            continue
     return None
 
 @bot.command()
@@ -1039,28 +1081,12 @@ async def play(ctx, *, search=None):
         return await ctx.send("Usage: !p <song name>")
 
     if "spotify.com" in search:
-        if not sp:
-            return await ctx.send("Spotify credentials are not configured yet.")
-        try:
-            if "track" in search:
-                track = sp.track(search)
-                search = f"{track['name']} {track['artists'][0]['name']} audio"
-            elif "playlist" in search:
-                playlist = sp.playlist_tracks(search, limit=1)
-                if playlist['items']:
-                    track = playlist['items'][0]['track']
-                    search = f"{track['name']} {track['artists'][0]['name']} audio"
-                    await ctx.send("🔍 Playlist link detected! I will play the **first track** for now.")
-                else:
-                    return await ctx.send("Playlist is empty.")
-            elif "album" in search:
-                album = sp.album_tracks(search, limit=1)
-                if album['items']:
-                    track = album['items'][0]
-                    search = f"{track['name']} {track['artists'][0]['name']} audio"
-                    await ctx.send("🔍 Album link detected! I will play the **first track** for now.")
-        except Exception as e:
-            return await ctx.send(f"Error reading Spotify link: {e}")
+        query = await get_spotify_query(search)
+        if not query:
+            return await ctx.send("❌ Could not read that Spotify link. Try pasting the song name directly.")
+        if "playlist" in search or "album" in search:
+            await ctx.send("🔍 Spotify link detected — playing the **first track**.")
+        search = query
 
     async with ctx.typing():
         info = await _yt_extract(search)
@@ -1102,28 +1128,12 @@ async def playnext(ctx, *, search=None):
         return await ctx.send("Usage: !pn <song name>")
 
     if "spotify.com" in search:
-        if not sp:
-            return await ctx.send("Spotify credentials are not configured yet.")
-        try:
-            if "track" in search:
-                track = sp.track(search)
-                search = f"{track['name']} {track['artists'][0]['name']} audio"
-            elif "playlist" in search:
-                playlist = sp.playlist_tracks(search, limit=1)
-                if playlist['items']:
-                    track = playlist['items'][0]['track']
-                    search = f"{track['name']} {track['artists'][0]['name']} audio"
-                    await ctx.send("🔍 Playlist link detected! I will queue the **first track** for now.")
-                else:
-                    return await ctx.send("Playlist is empty.")
-            elif "album" in search:
-                album = sp.album_tracks(search, limit=1)
-                if album['items']:
-                    track = album['items'][0]
-                    search = f"{track['name']} {track['artists'][0]['name']} audio"
-                    await ctx.send("🔍 Album link detected! I will queue the **first track** for now.")
-        except Exception as e:
-            return await ctx.send(f"Error reading Spotify link: {e}")
+        query = await get_spotify_query(search)
+        if not query:
+            return await ctx.send("❌ Could not read that Spotify link. Try pasting the song name directly.")
+        if "playlist" in search or "album" in search:
+            await ctx.send("🔍 Spotify link detected — queuing the **first track**.")
+        search = query
 
     async with ctx.typing():
         info = await _yt_extract(search)
