@@ -989,11 +989,11 @@ async def _scrape_og_query(url: str, source: str) -> str | None:
     Works for Spotify, Apple Music, and similar services — no API key needed.
     """
     try:
+        # We must use a known crawler User-Agent (like Discord or Facebook)
+        # otherwise Spotify/Apple Music serve an empty React skeleton via JS.
         headers = {
             'User-Agent': (
-                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
-                'AppleWebKit/537.36 (KHTML, like Gecko) '
-                'Chrome/122.0.0.0 Safari/537.36'
+                'Mozilla/5.0 (compatible; Discordbot/2.0; +https://discordapp.com)'
             )
         }
         async with aiohttp.ClientSession() as session:
