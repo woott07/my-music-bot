@@ -6,6 +6,7 @@ logs/
 logs/
 discordbot.log
 *.csv
-*.txt
+# cookies.txt is intentionally tracked (needed for Railway deployment)
+!cookies.txt
 practice.py
 lec2.py
