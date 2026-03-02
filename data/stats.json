@@ -1,0 +1,14 @@
+{
+  "join": 4,
+  "play": 3,
+  "help": 2,
+  "giverole": 1,
+  "removerole": 1,
+  "serverinfo": 1,
+  "userinfo": 1,
+  "avatar": 1,
+  "lock": 1,
+  "unlock": 1,
+  "ping": 2,
+  "leave": 1
+}

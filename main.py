@@ -191,14 +191,13 @@ def play_next(ctx):
     source = discord.FFmpegPCMAudio(song['url'], executable=FFMPEG_EXE, **FFMPEG_OPTIONS)
     ctx.voice_client.play(source, after=lambda e: play_next(ctx))
 
-    channel = now_playing_channel or ctx.channel
-    embed = _build_now_playing_embed(song)
-    view = MusicControls(ctx)
+    async def send_now_playing():
+        channel = now_playing_channel or ctx.channel
+        embed = _build_now_playing_embed(song)
+        view = MusicControls(ctx)
+        await channel.send(embed=embed, view=view)
 
-    asyncio.run_coroutine_threadsafe(
-        channel.send(embed=embed, view=view),
-        ctx.bot.loop
-    )
+    asyncio.run_coroutine_threadsafe(send_now_playing(), ctx.bot.loop)
 
 
 # ================================================================
