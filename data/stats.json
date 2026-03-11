@@ -1,6 +1,6 @@
 {
-  "join": 8,
-  "play": 11,
+  "join": 32,
+  "play": 15,
   "help": 2,
   "giverole": 1,
   "removerole": 1,
@@ -10,6 +10,7 @@
   "lock": 1,
   "unlock": 1,
   "ping": 2,
-  "leave": 2,
-  "skip": 2
+  "leave": 4,
+  "skip": 2,
+  "rejoin": 2
 }
